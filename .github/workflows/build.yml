@@ -36,11 +36,38 @@ jobs:
           fi
           chmod +x gradlew
 
-      - name: Apply Auto-Patches (Python)
+      - name: Configure Keystore and Extract Hash
+        run: |
+          # 1. Route the keystore to the app/ directory if it is sitting in the root
+          if [ -f "release.keystore" ]; then
+            cp release.keystore app/release.keystore
+          fi
+          
+          # 2. Setup keystore.properties with hardcoded credentials
+          cat << EOF > keystore.properties
+          storeFile=release.keystore
+          storePassword=abcdef
+          keyAlias=faphouse
+          keyPassword=abcdef
+          EOF
+          
+          # 3. Extract SHA-256 hash safely and export as environment variable
+          if [ -f "app/release.keystore" ]; then
+            SIG_HASH=$(keytool -list -v -keystore app/release.keystore -alias "faphouse" -storepass "abcdef" 2>/dev/null | grep SHA256 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+            echo "SIG_HASH=$SIG_HASH" >> $GITHUB_ENV
+            echo "Extracted SHA-256 Hash: $SIG_HASH"
+          else
+            echo "⚠️ release.keystore not found!"
+          fi
+
+      - name: Apply All Patches & Injections (Python)
+        env:
+          SIG_HASH: ${{ env.SIG_HASH }}
         run: |
           cat << 'EOF' > patch.py
           import os, re, glob
           PROJECT_ROOT = "."
+          sig_hash = os.environ.get("SIG_HASH", "")
 
           # 1. libs.versions.toml (Media3 to 1.11.1)
           toml = os.path.join(PROJECT_ROOT, "gradle", "libs.versions.toml")
@@ -66,7 +93,22 @@ jobs:
               with open(strings_xml, "w", encoding="utf-8") as f:
                   f.write(f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {missing_string}\n</resources>')
 
-          # 4. Kotlin Syntax Fixes
+          # 4. Inject SIGNATURE_HASH cleanly into build.gradle.kts
+          if sig_hash:
+              bg_path = os.path.join(PROJECT_ROOT, "app", "build.gradle.kts")
+              if os.path.isfile(bg_path):
+                  with open(bg_path, "r") as f: content = f.read()
+                  line = f'buildConfigField("String", "SIGNATURE_HASH", "\\"{sig_hash}\\"")'
+                  if "SIGNATURE_HASH" in content:
+                      content = re.sub(r'buildConfigField\("String", "SIGNATURE_HASH",.*?\)', line, content)
+                  else:
+                      idx = content.find('buildConfigField("String", "BUILD_TS"')
+                      if idx >= 0:
+                          eol = content.find("\n", idx)
+                          content = content[:eol] + "\n        " + line + content[eol:]
+                  with open(bg_path, "w") as f: f.write(content)
+
+          # 5. Kotlin Syntax Fixes
           crypto = os.path.join(PROJECT_ROOT, "app/src/main/java/com/drdev/faphousepro/security/Crypto.kt")
           if os.path.exists(crypto):
               with open(crypto, "r") as f: c = f.read()
@@ -122,35 +164,6 @@ jobs:
               with open(wdvm, "w") as f: f.write(c)
           EOF
           python3 patch.py
-
-      - name: Configure Keystore and Hash
-        run: |
-          # 1. Route the keystore to the app/ directory if it is sitting in the root
-          if [ -f "release.keystore" ]; then
-            cp release.keystore app/release.keystore
-          fi
-          
-          # 2. Setup keystore.properties with hardcoded credentials
-          cat << EOF > keystore.properties
-          storeFile=release.keystore
-          storePassword=abcdef
-          keyAlias=faphouse
-          keyPassword=abcdef
-          EOF
-          
-          # 3. Extract SHA-256 for the backend and inject it into build.gradle.kts
-          if [ -f "app/release.keystore" ]; then
-            SIG_HASH=$(keytool -list -v -keystore app/release.keystore -alias "faphouse" -storepass "abcdef" 2>/dev/null | grep SHA256 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
-            
-            if [ -n "$SIG_HASH" ]; then
-              echo "Extracted SHA-256 Hash: $SIG_HASH"
-              sed -i "s/buildConfigField(\"String\", \"SIGNATURE_HASH\".*/buildConfigField(\"String\", \"SIGNATURE_HASH\", \"\\\"$SIG_HASH\\\"\")/g" app/build.gradle.kts
-            else
-              echo "⚠️ Failed to extract SHA-256 hash. Ensure release.keystore is valid."
-            fi
-          else
-            echo "⚠️ release.keystore not found. Make sure it is committed to your repository!"
-          fi
 
       - name: Build Release APK
         run: ./gradlew assembleRelease --stacktrace --no-daemon
