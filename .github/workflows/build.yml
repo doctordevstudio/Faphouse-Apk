@@ -1,0 +1,159 @@
+name: Build FapHouse Pro APK
+
+on:
+  workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
+  push:
+    branches:
+      - main         # Auto-builds when pushing to main
+
+jobs:
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Android NDK and CMake
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973" "cmake;3.22.1" "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Apply Auto-Patches (Python)
+        run: |
+          cat << 'EOF' > patch.py
+          import os, re, glob
+          PROJECT_ROOT = "."
+
+          # 1. libs.versions.toml (Media3 to 1.11.1)
+          toml = os.path.join(PROJECT_ROOT, "gradle", "libs.versions.toml")
+          if os.path.isfile(toml):
+              with open(toml, "r") as f: c = f.read()
+              c = re.sub(r'media3\s*=\s*["\']1\.[45]\.1["\']', 'media3 = "1.11.1"', c)
+              with open(toml, "w") as f: f.write(c)
+
+          # 2. Suppress SDK 36 warning
+          with open(os.path.join(PROJECT_ROOT, "gradle.properties"), "a") as f:
+              f.write("\nandroid.suppressUnsupportedCompileSdk=36\n")
+
+          # 3. strings.xml missing string
+          strings_xml = os.path.join(PROJECT_ROOT, "app", "src", "main", "res", "values", "strings.xml")
+          missing_string = '<string name="accessibility_service_description">Accessibility Service for FapHouse Pro</string>'
+          if os.path.isfile(strings_xml):
+              with open(strings_xml, "r", encoding="utf-8") as f: c = f.read()
+              if "accessibility_service_description" not in c:
+                  c = c.replace("</resources>", f"    {missing_string}\n</resources>")
+                  with open(strings_xml, "w", encoding="utf-8") as f: f.write(c)
+          else:
+              os.makedirs(os.path.dirname(strings_xml), exist_ok=True)
+              with open(strings_xml, "w", encoding="utf-8") as f:
+                  f.write(f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    {missing_string}\n</resources>')
+
+          # 4. Kotlin Syntax Fixes
+          crypto = os.path.join(PROJECT_ROOT, "app/src/main/java/com/drdev/faphousepro/security/Crypto.kt")
+          if os.path.exists(crypto):
+              with open(crypto, "r") as f: c = f.read()
+              if "ExperimentalEncodingApi" not in c:
+                  with open(crypto, "w") as f: f.write("@file:kotlin.OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)\n" + c)
+
+          dialogs = os.path.join(PROJECT_ROOT, "app/src/main/java/com/drdev/faphousepro/ui/components/Dialogs.kt")
+          if os.path.exists(dialogs):
+              with open(dialogs, "r") as f: c = f.read()
+              if "androidx.core.graphics.drawable.toBitmap" not in c:
+                  c = c.replace("package com.drdev.faphousepro.ui.components", "package com.drdev.faphousepro.ui.components\n\nimport androidx.core.graphics.drawable.toBitmap")
+              c = c.replace("toBitmap(it).asImageBitmap()", "it.toBitmap().asImageBitmap()")
+              with open(dialogs, "w") as f: f.write(c)
+
+          splash = os.path.join(PROJECT_ROOT, "app/src/main/java/com/drdev/faphousepro/ui/splash/SplashActivity.kt")
+          if os.path.exists(splash):
+              with open(splash, "r") as f: c = f.read()
+              if "androidx.compose.ui.res.stringResource" not in c:
+                  c = c.replace("package com.drdev.faphousepro.ui.splash", "package com.drdev.faphousepro.ui.splash\n\nimport androidx.compose.ui.res.stringResource")
+              with open(splash, "w") as f: f.write(c)
+
+          wv = os.path.join(PROJECT_ROOT, "app/src/main/java/com/drdev/faphousepro/ui/main/WebViewHost.kt")
+          if os.path.exists(wv):
+              with open(wv, "r") as f: c = f.read()
+              c = c.replace("webViewClient = null", "webViewClient = android.webkit.WebViewClient()")
+              c = c.replace("webChromeClient = null", "webChromeClient = android.webkit.WebChromeClient()")
+              c = c.replace("settings.supportMultipleWindows = false", "settings.setSupportMultipleWindows(false)")
+              c = c.replace("settings.supportMultipleWindows = true", "settings.setSupportMultipleWindows(true)")
+              c = c.replace("supportMultipleWindows = false", "settings.setSupportMultipleWindows(false)")
+              c = c.replace("supportMultipleWindows = true", "settings.setSupportMultipleWindows(true)")
+              c = c.replace("setSupportMultipleWindows(true)", "settings.setSupportMultipleWindows(true)")
+              c = c.replace("setSupportMultipleWindows(false)", "settings.setSupportMultipleWindows(false)")
+              c = c.replace("settings.settings.", "settings.")
+              with open(wv, "w") as f: f.write(c)
+
+          main_act = os.path.join(PROJECT_ROOT, "app/src/main/java/com/drdev/faphousepro/ui/main/MainActivity.kt")
+          if os.path.exists(main_act):
+              with open(main_act, "r") as f: lines = f.readlines()
+              for i, line in enumerate(lines):
+                  if "showSnackbar(" in line and "launch {" not in line:
+                      lines[i] = re.sub(
+                          r'(?:snackbar\.)?showSnackbar\(([^)]+)\)',
+                          r'@OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class) kotlinx.coroutines.GlobalScope.launch { snackbar.showSnackbar(\1) }',
+                          line
+                      )
+              with open(main_act, "w") as f: f.writelines(lines)
+
+          wdvm = next((f for f in glob.glob(os.path.join(PROJECT_ROOT, "app/src/main/java/**/*.kt"), recursive=True) if "WatchDownloadViewModel.kt" in f), None)
+          if wdvm:
+              with open(wdvm, "r") as f: c = f.read()
+              if ".get().firstOrNull()" not in c:
+                  c = c.replace('wm.getWorkInfosByTag("download_$id").firstOrNull()', 'wm.getWorkInfosByTag("download_$id").get().firstOrNull()')
+              with open(wdvm, "w") as f: f.write(c)
+          EOF
+          python3 patch.py
+
+      - name: Configure Keystore and Hash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            # Decode keystore to the app/ directory
+            echo "$KEYSTORE_B64" | base64 --decode > app/release.keystore
+            
+            # Setup keystore.properties in root directory
+            echo "storeFile=release.keystore" > keystore.properties
+            echo "storePassword=$KEYSTORE_PASS" >> keystore.properties
+            echo "keyAlias=$KEY_ALIAS" >> keystore.properties
+            echo "keyPassword=$KEY_PASS" >> keystore.properties
+            
+            # Extract SHA-256 for the API Backend
+            SIG_HASH=$(keytool -list -v -keystore app/release.keystore -alias "$KEY_ALIAS" -storepass "$KEYSTORE_PASS" | grep SHA256 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+            echo "Extracted SHA-256 Hash: $SIG_HASH"
+            
+            # Inject Hash into build.gradle.kts
+            sed -i "s/buildConfigField(\"String\", \"SIGNATURE_HASH\".*/buildConfigField(\"String\", \"SIGNATURE_HASH\", \"\\\"$SIG_HASH\\\"\")/g" app/build.gradle.kts
+          else
+            echo "⚠️ No GitHub Secrets found. Falling back to unsigned / debug configurations."
+          fi
+
+      - name: Grant Execute Permission for Gradle
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FapHousePro-Release-APK
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Upload Proguard Mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: FapHousePro-Mapping
+          path: app/build/outputs/mapping/release/mapping.txt
