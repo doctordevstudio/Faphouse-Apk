@@ -1,10 +1,10 @@
 name: Build FapHouse Pro APK
 
 on:
-  workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
   push:
     branches:
-      - main         # Auto-builds when pushing to main
+      - main         # Auto-builds when pushing to the main branch
 
 jobs:
   build:
@@ -25,6 +25,16 @@ jobs:
       - name: Setup Android NDK and CMake
         run: |
           echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973" "cmake;3.22.1" "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Generate Gradle Wrapper
+        run: |
+          if [ ! -f "gradlew" ]; then
+            echo "gradlew not found. Generating wrapper for Gradle 9.3.1..."
+            wget -q https://services.gradle.org/distributions/gradle-9.3.1-bin.zip -O /tmp/gradle-dist.zip
+            unzip -q -o /tmp/gradle-dist.zip -d /tmp/gradle-dist
+            /tmp/gradle-dist/gradle-9.3.1/bin/gradle wrapper --gradle-version 9.3.1 --distribution-type bin
+          fi
+          chmod +x gradlew
 
       - name: Apply Auto-Patches (Python)
         run: |
@@ -114,34 +124,33 @@ jobs:
           python3 patch.py
 
       - name: Configure Keystore and Hash
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASS: ${{ secrets.KEY_PASS }}
         run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            # Decode keystore to the app/ directory
-            echo "$KEYSTORE_B64" | base64 --decode > app/release.keystore
-            
-            # Setup keystore.properties in root directory
-            echo "storeFile=release.keystore" > keystore.properties
-            echo "storePassword=$KEYSTORE_PASS" >> keystore.properties
-            echo "keyAlias=$KEY_ALIAS" >> keystore.properties
-            echo "keyPassword=$KEY_PASS" >> keystore.properties
-            
-            # Extract SHA-256 for the API Backend
-            SIG_HASH=$(keytool -list -v -keystore app/release.keystore -alias "$KEY_ALIAS" -storepass "$KEYSTORE_PASS" | grep SHA256 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
-            echo "Extracted SHA-256 Hash: $SIG_HASH"
-            
-            # Inject Hash into build.gradle.kts
-            sed -i "s/buildConfigField(\"String\", \"SIGNATURE_HASH\".*/buildConfigField(\"String\", \"SIGNATURE_HASH\", \"\\\"$SIG_HASH\\\"\")/g" app/build.gradle.kts
-          else
-            echo "⚠️ No GitHub Secrets found. Falling back to unsigned / debug configurations."
+          # 1. Route the keystore to the app/ directory if it is sitting in the root
+          if [ -f "release.keystore" ]; then
+            cp release.keystore app/release.keystore
           fi
-
-      - name: Grant Execute Permission for Gradle
-        run: chmod +x gradlew
+          
+          # 2. Setup keystore.properties with hardcoded credentials
+          cat << EOF > keystore.properties
+          storeFile=release.keystore
+          storePassword=abcdef
+          keyAlias=faphouse
+          keyPassword=abcdef
+          EOF
+          
+          # 3. Extract SHA-256 for the backend and inject it into build.gradle.kts
+          if [ -f "app/release.keystore" ]; then
+            SIG_HASH=$(keytool -list -v -keystore app/release.keystore -alias "faphouse" -storepass "abcdef" 2>/dev/null | grep SHA256 | awk '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+            
+            if [ -n "$SIG_HASH" ]; then
+              echo "Extracted SHA-256 Hash: $SIG_HASH"
+              sed -i "s/buildConfigField(\"String\", \"SIGNATURE_HASH\".*/buildConfigField(\"String\", \"SIGNATURE_HASH\", \"\\\"$SIG_HASH\\\"\")/g" app/build.gradle.kts
+            else
+              echo "⚠️ Failed to extract SHA-256 hash. Ensure release.keystore is valid."
+            fi
+          else
+            echo "⚠️ release.keystore not found. Make sure it is committed to your repository!"
+          fi
 
       - name: Build Release APK
         run: ./gradlew assembleRelease --stacktrace --no-daemon
